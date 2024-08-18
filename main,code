@@ -1,0 +1,180 @@
+!pip install transformers datasets evaluate accelerate peft
+import torch
+from transformers import GPT2Tokenizer, GPT2LMHeadModel
+import numpy as np
+
+import logging
+logging.getLogger().setLevel(logging.CRITICAL)
+
+import warnings
+warnings.filterwarnings('ignore')
+
+device = 'cpu'
+print(device)
+tokenizer = GPT2Tokenizer.from_pretrained('gpt2-medium')
+model = GPT2LMHeadModel.from_pretrained('gpt2-medium')
+model = model.to(device)
+from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
+import os
+import json
+import csv
+
+class pythonDataset(Dataset):
+    def __init__(self, jokes_dataset_path = '/kaggle/input/chatbot-ai-q-and-a'):
+        super().__init__()
+
+        short_jokes_path = os.path.join(jokes_dataset_path, 'AI.csv')
+
+        self.joke_list = []
+        self.end_of_text_token = "<|endoftext|>"
+        
+        with open(short_jokes_path) as csv_file:
+            csv_reader = csv.reader(csv_file, delimiter=',')
+              
+            next(csv_reader, None) 
+            
+            for row in csv_reader:
+                # Check if row has the expected number of columns
+                if len(row) > 1:
+                    joke_str = f"data:{row[1]}{self.end_of_text_token}"
+                    self.joke_list.append(joke_str)
+        
+    def __len__(self):
+        return len(self.joke_list)
+
+    def __getitem__(self, item):
+        return self.joke_list[item]
+dataset = pythonDataset()
+data_loader = DataLoader(dataset, batch_size=32, shuffle=True)
+
+BATCH_SIZE = 16
+EPOCHS = 5
+LEARNING_RATE = 1e-6
+WARMUP_STEPS = 500
+MAX_SEQ_LEN = 40
+
+from transformers import AdamW, get_linear_schedule_with_warmup
+
+model.train()
+optimizer = AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=0.01)
+num_training_steps = len(data_loader) * EPOCHS
+scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=WARMUP_STEPS, num_training_steps=num_training_steps)
+
+proc_seq_count = 0
+sum_loss = 0.0
+batch_count = 0
+
+tmp_paragraphs_tens = None
+models_folder = "/kaggle/working/trained_models"  # folder for the trained model
+
+if not os.path.exists(models_folder):
+    os.mkdir(models_folder)
+
+for epoch in range(EPOCHS):
+    
+    print(f"EPOCH {epoch} started" + '=' * 30)
+    
+    for idx, paragraph in enumerate(data_loader):
+        
+        #################### Fit as many paragraph sequences into MAX_SEQ_LEN sequence as possible ####
+        paragraph_tens = torch.tensor(tokenizer.encode(paragraph[0])).unsqueeze(0).to(device)
+        
+        if paragraph_tens.size()[1] > MAX_SEQ_LEN:
+            paragraph_tens = paragraph_tens[:, :MAX_SEQ_LEN]
+        
+        if not torch.is_tensor(tmp_paragraphs_tens):
+            tmp_paragraphs_tens = paragraph_tens
+            continue
+        else:
+            if tmp_paragraphs_tens.size()[1] + paragraph_tens.size()[1] > MAX_SEQ_LEN:
+                work_paragraphs_tens = tmp_paragraphs_tens
+                tmp_paragraphs_tens = paragraph_tens
+            else:
+                tmp_paragraphs_tens = torch.cat([tmp_paragraphs_tens, paragraph_tens[:, 1:]], dim=1)
+                continue
+                
+        outputs = model(work_paragraphs_tens, labels=work_paragraphs_tens)
+        loss, logits = outputs[:2]                        
+        loss.backward()
+        sum_loss += loss.detach().data
+                       
+        proc_seq_count += 1
+        if proc_seq_count == BATCH_SIZE:
+            proc_seq_count = 0    
+            batch_count += 1
+            optimizer.step()
+            scheduler.step() 
+            optimizer.zero_grad()
+            model.zero_grad()
+
+        if batch_count == 100:
+            print(f"sum loss is {sum_loss}")
+            batch_count = 0
+            sum_loss = 0.0
+    
+    torch.save(model.state_dict(), os.path.join(models_folder, f"gpt2_medium_pythonlecturer_{epoch}.pt"))
+
+def choose_from_top(probs, n=2, random_seed=None):
+    ind = np.argpartition(probs, -n)[-n:]
+    top_prob = probs[ind]
+    top_prob = top_prob / np.sum(top_prob) # Normalize
+    np.random.seed(random_seed)
+    choice = np.random.choice(n, 1, p = top_prob)
+    token_id = ind[choice][0]
+    return int(token_id)
+​
+def nucleus_sampling(probs, p=0.9, random_seed=None):
+    sorted_indices = np.argsort(probs)[::-1]
+    sorted_probs = np.sort(probs)[::-1]
+    cumulative_probs = np.cumsum(sorted_probs)
+    cutoff_index = np.searchsorted(cumulative_probs, p)
+    filtered_indices = sorted_indices[:cutoff_index + 1]
+    filtered_probs = probs[filtered_indices]
+    filtered_probs /= np.sum(filtered_probs)
+    np.random.seed(random_seed)
+    return np.random.choice(filtered_indices, p=filtered_probs)
+
+MODEL_EPOCH = 4
+model_path = os.path.join(models_folder, f"gpt2_medium_pythonlecturer_{MODEL_EPOCH}.pt")
+model.load_state_dict(torch.load(model_path))
+​
+generated_paragraph = 5
+first_sentence = "Q:Who created the Hebbian learning rule? \n\n A:"
+max_paragraph_length = 100
+​
+paragraphs_output_file_path = os.path.join("/kaggle/working/", f'generated_lectures_{MODEL_EPOCH}.txt')
+audio_file_folder = "/kaggle/working/"
+if os.path.exists(paragraphs_output_file_path):
+    os.remove(paragraphs_output_file_path)
+​
+randomness = None
+model.eval()
+with torch.no_grad():
+    for paragraph_idx in range(generated_paragraph):
+        paragraph_finished = False
+        cur_ids = torch.tensor(tokenizer.encode(first_sentence)).unsqueeze(0).to(device)
+        for i in range(max_paragraph_length):
+            outputs = model(cur_ids, labels=cur_ids)
+            loss, logits = outputs[:2]
+            softmax_logits = torch.softmax(logits[0, -1], dim=0)
+            if i < 3:
+                n = 20
+            else:
+                n = 3
+                
+            next_token_id = choose_from_top(softmax_logits.to('cpu').numpy(), n=n, random_seed=randomness)
+​
+            cur_ids = torch.cat([cur_ids, torch.ones((1, 1)).long().to(device) * next_token_id], dim=1)
+​
+            if next_token_id in tokenizer.encode('.'):
+                paragraph_finished = True
+                break
+​
+        if paragraph_finished:
+            output_list = list(cur_ids.squeeze().to('cpu').numpy())
+            output_text = tokenizer.decode(output_list)
+            print(output_text + "\n")
+​
+            with open(paragraphs_output_file_path, 'a') as f:
+                f.write(f"{output_text} \n\n")
